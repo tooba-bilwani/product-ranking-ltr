@@ -33,7 +33,13 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from scipy.sparse import csr_matrix
+from scipy.sparse.linalg import svds
 from xgboost import XGBRanker
+
+MF_DIM = 20   # latent dimensions for the collaborative-filtering embeddings
+CONTENT_FEATS = ["item_pop_log", "item_mean", "user_activity", "user_mean", "genre_match"]
+FULL_FEATS = CONTENT_FEATS + ["mf_score"]   # content + collaborative-filtering
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "data" / "ml-100k"
@@ -72,6 +78,30 @@ def temporal_split(ratings, test_frac=0.2, min_inter=10):
 
 
 # ------------------------- feature engineering ------------------------------
+def compute_mf(train, k=MF_DIM):
+    """Matrix factorization on the TRAIN positives -> user & item embeddings in
+    one shared latent space (collaborative filtering).
+
+    Build the sparse user x item matrix of positives (rating >= 4), factor it
+    with truncated SVD, and read off a k-dim vector for each user and each item.
+    The dot product of a user vector and an item vector is the 'collaborative
+    affinity' — learned purely from co-rating behavior, no genre labels.
+    """
+    pos = train[train["rating"] >= 4]
+    u_ids = sorted(pos["user"].unique())
+    i_ids = sorted(pos["item"].unique())
+    uidx = {u: i for i, u in enumerate(u_ids)}
+    iidx = {it: i for i, it in enumerate(i_ids)}
+    rows = pos["user"].map(uidx).to_numpy()
+    cols = pos["item"].map(iidx).to_numpy()
+    R = csr_matrix((np.ones(len(pos)), (rows, cols)), shape=(len(u_ids), len(i_ids)))
+    k = min(k, min(R.shape) - 1)
+    U, s, Vt = svds(R, k=k)           # R ~= U @ diag(s) @ Vt
+    return {"uidx": uidx, "iidx": iidx,
+            "user_emb": U * s,        # (n_users, k)
+            "item_emb": Vt.T}         # (n_items, k)
+
+
 def build_feature_tables(train, genres):
     """Everything here is derived from TRAIN ONLY (leakage guard)."""
     g_mean = train["rating"].mean()
@@ -93,6 +123,7 @@ def build_feature_tables(train, genres):
         "user_stats": user_stats,
         "user_genre": user_genre,
         "genres": genres,
+        "mf": compute_mf(train),       # collaborative-filtering embeddings
     }
 
 
@@ -111,8 +142,19 @@ def featurize(pairs, ft):
     ig = ft["genres"].reindex(df["item"].values).fillna(0.0).to_numpy()
     df["genre_match"] = (ug * ig).sum(axis=1)
 
-    feats = ["item_pop_log", "item_mean", "user_activity", "user_mean", "genre_match"]
-    return df[feats], feats
+    # collaborative-filtering affinity = dot(user_emb, item_emb); 0 for cold
+    # users/items with no learned embedding (that's when genre_match carries it).
+    mf = ft["mf"]
+    uix = df["user"].map(mf["uidx"])
+    iix = df["item"].map(mf["iidx"])
+    score = np.zeros(len(df))
+    mask = uix.notna().to_numpy() & iix.notna().to_numpy()
+    if mask.any():
+        u = uix[mask].astype(int).to_numpy()
+        i = iix[mask].astype(int).to_numpy()
+        score[mask] = (mf["user_emb"][u] * mf["item_emb"][i]).sum(axis=1)
+    df["mf_score"] = score
+    return df
 
 
 # ------------------------- candidate construction ---------------------------
@@ -223,23 +265,29 @@ def main():
 
     ft = build_feature_tables(train, genres)
     pop_w = popularity_weights(train, all_items)   # for hard-negative sampling
-
-    # ---- train LambdaMART ranker ----
     tr = build_training_frame(train, all_items, pop_w)
-    X, feat_names = featurize(tr[["user", "item"]], ft)
     groups = tr.groupby("user").size().to_numpy()
-    ranker = XGBRanker(objective="rank:ndcg", n_estimators=300, learning_rate=0.1,
-                       max_depth=6, subsample=0.8, colsample_bytree=0.8,
-                       random_state=42)
-    ranker.fit(X.to_numpy(), tr["rel"].to_numpy(), group=groups)
+    tr_feats = featurize(tr[["user", "item"]], ft)
 
-    # ---- evaluate (popularity-matched hard negatives) ----
+    def train_ranker(feature_cols):
+        r = XGBRanker(objective="rank:ndcg", n_estimators=300, learning_rate=0.1,
+                      max_depth=6, subsample=0.8, colsample_bytree=0.8,
+                      random_state=42)
+        r.fit(tr_feats[feature_cols].to_numpy(), tr["rel"].to_numpy(), group=groups)
+        return r
+
+    # v1 = content + popularity features; v2 = v1 + collaborative-filtering embedding
+    ranker_v1 = train_ranker(CONTENT_FEATS)
+    ranker_v2 = train_ranker(FULL_FEATS)
+
     eval_lists = build_eval_lists(test, train, all_items, pop_w)
     print(f"eval users with >=1 relevant test item: {len(eval_lists)}")
 
-    def model_score(user, items):
-        X, _ = featurize(pd.DataFrame({"user": user, "item": items}), ft)
-        return ranker.predict(X.to_numpy())
+    def make_scorer(ranker, cols):
+        def score(user, items):
+            X = featurize(pd.DataFrame({"user": user, "item": items}), ft)
+            return ranker.predict(X[cols].to_numpy())
+        return score
 
     pop = ft["item_stats"]["item_pop"]
 
@@ -247,29 +295,38 @@ def main():
         return pop.reindex(items).fillna(0.0).to_numpy()
 
     baseline = evaluate(eval_lists, pop_score)
-    model = evaluate(eval_lists, model_score)
+    v1 = evaluate(eval_lists, make_scorer(ranker_v1, CONTENT_FEATS))
+    v2 = evaluate(eval_lists, make_scorer(ranker_v2, FULL_FEATS))
 
-    lift = {m: round(100 * (model[m] - baseline[m]) / baseline[m], 1)
-            for m in baseline}
-    out = {"baseline_popularity": baseline, "lambdamart": model,
-           "lift_pct": lift, "feature_importance":
-           dict(sorted(zip(feat_names, ranker.feature_importances_.tolist()),
-                       key=lambda x: -x[1]))}
+    def lift(a, b):   # % improvement of b over a
+        return {m: round(100 * (b[m] - a[m]) / a[m], 1) for m in a}
+
+    out = {
+        "baseline_popularity": baseline,
+        "v1_ltr_content": v1,
+        "v2_ltr_content_plus_cf": v2,
+        "lift_v1_vs_baseline": lift(baseline, v1),
+        "lift_v2_vs_baseline": lift(baseline, v2),
+        "lift_v2_vs_v1": lift(v1, v2),
+        "v2_feature_importance": dict(sorted(
+            zip(FULL_FEATS, ranker_v2.feature_importances_.tolist()),
+            key=lambda x: -x[1])),
+    }
     (RESULTS / "metrics.json").write_text(json.dumps(out, indent=2))
     print(json.dumps(out, indent=2))
 
-    # ---- chart ----
+    # ---- chart: baseline vs v1 vs v2 ----
     metrics = list(baseline)
     x = np.arange(len(metrics))
-    plt.figure(figsize=(7, 4.5))
-    plt.bar(x - 0.2, [baseline[m] for m in metrics], 0.4, label="Popularity baseline")
-    plt.bar(x + 0.2, [model[m] for m in metrics], 0.4, label="LambdaMART (LTR)")
+    plt.figure(figsize=(8, 4.8))
+    for off, res, label in [(-0.27, baseline, "Popularity baseline"),
+                            (0.0, v1, "LTR: content"),
+                            (0.27, v2, "LTR: content + CF embeddings")]:
+        plt.bar(x + off, [res[m] for m in metrics], 0.26, label=label)
     plt.xticks(x, metrics)
     plt.ylabel("score")
-    plt.title("Personalized ranking: LambdaMART vs popularity baseline (MovieLens-100k)")
+    plt.title("Personalized ranking on MovieLens-100k")
     plt.legend()
-    for i, m in enumerate(metrics):
-        plt.text(i + 0.2, model[m] + 0.005, f"+{lift[m]}%", ha="center", fontsize=9)
     plt.tight_layout()
     plt.savefig(RESULTS / "ranking_comparison.png", dpi=130)
     print(f"\nWrote {RESULTS/'metrics.json'} and {RESULTS/'ranking_comparison.png'}")
